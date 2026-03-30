@@ -1,14 +1,16 @@
 /**
- * DHL Cloud Watcher — Google Apps Script
+ * AWB Cloud Watcher — Google Apps Script
  *
  * Monitors a shared Google Drive folder for AWB files (PDF/Excel).
- * When a new file is detected, it extracts waybill data and pushes
- * it to Google Sheets automatically.
+ * When a new file is detected, it extracts waybill data, matches it
+ * to existing orders in the brand tab, and updates the Tracking Number.
  *
  * Setup:
  *   1. Set FOLDER_ID and PROCESSED_FOLDER_ID in Config.gs
- *   2. Run setupTrigger() once to create the auto-polling trigger
- *   3. Done — files dropped in the folder will be processed automatically
+ *   2. Set ACTIVE_BRAND in Config.gs (e.g., "heartio")
+ *   3. Enable Drive API: Extensions → Apps Script → Services → Drive API v2
+ *   4. Run setupTrigger() once to create the auto-polling trigger
+ *   5. Done — files dropped in the folder will be processed automatically
  */
 
 // ── MAIN: Process new files in the AWB Drop Zone ──────────────────
@@ -16,8 +18,9 @@ function processNewFiles() {
   var folder    = DriveApp.getFolderById(CONFIG.FOLDER_ID);
   var processed = DriveApp.getFolderById(CONFIG.PROCESSED_FOLDER_ID);
   var files     = folder.getFiles();
-  var totalNv   = 0;
-  var totalDhl  = 0;
+  var brand     = CONFIG.ACTIVE_BRAND;
+  var totalUpdated  = 0;
+  var totalNotFound = 0;
 
   while (files.hasNext()) {
     var file     = files.next();
@@ -27,7 +30,7 @@ function processNewFiles() {
     // Skip non-AWB files
     if (!isAwbFile(name, mimeType)) continue;
 
-    Logger.log("Processing: " + file.getName());
+    Logger.log("📄 Processing: " + file.getName() + " (Brand: " + brand + ")");
 
     var results = [];
     try {
@@ -41,32 +44,33 @@ function processNewFiles() {
         results = extractFromCsv(file);
       }
     } catch (e) {
-      Logger.log("ERROR processing " + file.getName() + ": " + e.message);
+      Logger.log("❌ ERROR processing " + file.getName() + ": " + e.message);
       continue;
     }
 
     if (results.length === 0) {
       Logger.log("  No waybill data found in " + file.getName());
-      // Still move to processed to avoid re-scanning
       file.moveTo(processed);
       continue;
     }
 
-    // Upload to Google Sheets
-    var counts = pushToSheets(results);
-    totalNv  += counts.ninjavan;
-    totalDhl += counts.dhl;
+    Logger.log("  Extracted " + results.length + " tracking entries");
 
-    Logger.log("  Uploaded " + results.length + " waybills (" + counts.ninjavan + " NV, " + counts.dhl + " DHL)");
+    // Match and update in the brand's tab
+    var counts = updateTrackingInSheet(brand, results);
+    totalUpdated  += counts.updated;
+    totalNotFound += counts.notFound;
+
+    Logger.log("  Result: " + counts.updated + " updated, " + counts.notFound + " not matched");
 
     // Move to Processed folder
     file.moveTo(processed);
-    Logger.log("  Moved to Processed/");
+    Logger.log("  ✅ Moved to Processed/");
   }
 
   // Send email notification if anything was processed
-  if (totalNv + totalDhl > 0) {
-    sendNotification(totalNv, totalDhl);
+  if (totalUpdated > 0 || totalNotFound > 0) {
+    sendNotification(brand, totalUpdated, totalNotFound);
   }
 }
 
@@ -82,7 +86,7 @@ function isAwbFile(name, mimeType) {
     return false;
   }
 
-  // Keyword check (same as local watcher)
+  // Keyword check
   var keywords = CONFIG.AWB_KEYWORDS;
   return keywords.some(function(kw) { return name.indexOf(kw) !== -1; });
 }
@@ -91,7 +95,7 @@ function isAwbFile(name, mimeType) {
 // ── TRIGGER SETUP ─────────────────────────────────────────────────
 /**
  * Run this function ONCE to set up the automatic trigger.
- * It creates a time-based trigger that checks for new files every 1 minute.
+ * Creates a time-based trigger that checks for new files every 1 minute.
  */
 function setupTrigger() {
   // Remove any existing triggers first
@@ -108,7 +112,7 @@ function setupTrigger() {
     .everyMinutes(1)
     .create();
 
-  Logger.log("Trigger created: processNewFiles runs every 1 minute");
+  Logger.log("✅ Trigger created: processNewFiles runs every 1 minute");
 }
 
 /**
@@ -124,16 +128,35 @@ function removeTriggers() {
 
 
 // ── NOTIFICATION ──────────────────────────────────────────────────
-function sendNotification(nvCount, dhlCount) {
+function sendNotification(brand, updatedCount, notFoundCount) {
   if (!CONFIG.NOTIFY_EMAIL) return;
 
-  var total = nvCount + dhlCount;
-  var subject = "AWB Auto-Upload: " + total + " waybill(s) processed";
-  var body = "DHL Cloud Watcher processed new files:\n\n" +
-             "  NinjaVan: " + nvCount + " rows → SG_NINJAVAN tab\n" +
-             "  DHL:      " + dhlCount + " rows → NH_DHL tab\n\n" +
+  var brandConfig = CONFIG.BRANDS[brand];
+  var tabName = brandConfig ? brandConfig.tabName : brand;
+  var total = updatedCount + notFoundCount;
+
+  var subject = "AWB Auto-Update: " + updatedCount + "/" + total + " tracking numbers matched (" + tabName + ")";
+  var body = "AWB Cloud Watcher processed new files:\n\n" +
+             "  Brand:    " + tabName + "\n" +
+             "  Updated:  " + updatedCount + " orders\n" +
+             "  No match: " + notFoundCount + " entries\n\n" +
              "Google Sheet: https://docs.google.com/spreadsheets/d/" + CONFIG.SPREADSHEET_ID;
 
   MailApp.sendEmail(CONFIG.NOTIFY_EMAIL, subject, body);
-  Logger.log("Notification sent to " + CONFIG.NOTIFY_EMAIL);
+  Logger.log("📧 Notification sent to " + CONFIG.NOTIFY_EMAIL);
+}
+
+
+// ── MANUAL TEST ───────────────────────────────────────────────────
+/**
+ * Run this to test the setup without waiting for the trigger.
+ * Make sure you have a file in the AWB Drop Zone folder first.
+ */
+function testProcessing() {
+  Logger.log("=== MANUAL TEST RUN ===");
+  Logger.log("Active brand: " + CONFIG.ACTIVE_BRAND);
+  Logger.log("Spreadsheet: " + CONFIG.SPREADSHEET_ID);
+  Logger.log("Folder ID: " + CONFIG.FOLDER_ID);
+  processNewFiles();
+  Logger.log("=== TEST COMPLETE ===");
 }

@@ -1,15 +1,17 @@
 /**
  * Extraction logic — ported from Python dhl_watcher.py
  * Handles PDF (via OCR), Excel, and CSV files.
+ * Returns arrays of objects with: trackingId, shipmentId, recipientName,
+ * recipientPhone, cod, address, city, state, postalCode, carrier, orderRef
  */
 
 // ── CARRIER DETECTION ─────────────────────────────────────────────
 function detectCarrier(trackingId, fullText) {
   fullText = fullText || "";
-  if (/^NV[A-Z0-9]+$/.test(trackingId))        return "ninjavan";
-  if (/^\d{10,16}$/.test(trackingId))           return "dhl";
-  if (fullText.toLowerCase().indexOf("ninjavan") !== -1) return "ninjavan";
-  if (fullText.toLowerCase().indexOf("dhl") !== -1)      return "dhl";
+  if (/^NV[A-Z0-9]+$/.test(trackingId))                     return "ninjavan";
+  if (/^\d{10,16}$/.test(trackingId))                        return "dhl";
+  if (fullText.toLowerCase().indexOf("ninjavan") !== -1)     return "ninjavan";
+  if (fullText.toLowerCase().indexOf("dhl") !== -1)          return "dhl";
   return "ninjavan";  // default fallback
 }
 
@@ -38,79 +40,67 @@ function extractFromPdf(file) {
     var text = doc.getBody().getText();
     var lines = text.split("\n").map(function(l) { return l.trim(); }).filter(function(l) { return l.length > 0; });
 
-    var data = { "Tracking ID": "", "Recipient Name": "", "Recipient Contact": "", "Cash on Delivery": "", "carrier": "" };
+    // Process line by line, building entries as we find tracking IDs
+    var entry = null;
 
     for (var i = 0; i < lines.length; i++) {
       var line = lines[i];
 
-      // NinjaVan tracking
-      if (!data["Tracking ID"]) {
-        var nvMatch = line.match(/^(NV[A-Z0-9]+)$/);
-        if (nvMatch) {
-          data["Tracking ID"] = nvMatch[1];
-          data["carrier"]     = "ninjavan";
-        }
+      // NinjaVan tracking ID on its own line
+      var nvMatch = line.match(/^(NV[A-Z0-9]+)$/);
+      if (nvMatch) {
+        if (entry && entry.trackingId) results.push(entry);
+        entry = makeEmptyEntry();
+        entry.trackingId = nvMatch[1];
+        entry.carrier = "ninjavan";
+        continue;
       }
 
-      // DHL tracking (numeric 10-16 digits)
-      if (!data["Tracking ID"]) {
-        var dhlMatch = line.match(/^(\d{10,16})$/);
-        if (dhlMatch) {
-          data["Tracking ID"] = dhlMatch[1];
-          data["carrier"]     = "dhl";
-        }
+      // DHL tracking: only as first entry (not inside an active NV entry)
+      var dhlMatch = line.match(/^(\d{10,16})$/);
+      if (dhlMatch && !entry) {
+        entry = makeEmptyEntry();
+        entry.trackingId = dhlMatch[1];
+        entry.carrier = "dhl";
+        continue;
       }
 
-      // Recipient (after SHIP TO / CONSIGNEE / RECIPIENT)
+      if (!entry) continue;
+
+      // Recipient: line after SHIP TO / CONSIGNEE / RECIPIENT
       if (/^(SHIP\s*TO|CONSIGNEE|RECIPIENT)$/i.test(line) && i + 1 < lines.length) {
-        var nextLine   = lines[i + 1];
-        var phoneMatch = nextLine.match(/(\*+\d{3,}|\+?\d[\d\s]{7,})/);
+        var nextLine = lines[i + 1];
+        var phoneMatch = nextLine.match(/(\*{2,}\d{3,}|\+?\d[\d\s]{7,})$/);
         if (phoneMatch) {
-          data["Recipient Contact"] = phoneMatch[1].trim();
-          data["Recipient Name"]    = nextLine.substring(0, phoneMatch.index).trim();
+          entry.recipientPhone = phoneMatch[1].trim();
+          entry.recipientName = nextLine.substring(0, phoneMatch.index).trim();
         } else {
-          data["Recipient Name"] = nextLine.trim();
+          entry.recipientName = nextLine.trim();
         }
+        i++; // skip the name line
+        continue;
       }
 
       // COD amount
-      if (!data["Cash on Delivery"]) {
+      if (!entry.cod) {
         var codMatch = line.match(/COD[:\s]*(SGD|MYR|USD)?\s*([\d,]+\.?\d*)/i);
         if (codMatch) {
           var currency = codMatch[1] || "SGD";
-          var amount   = codMatch[2].replace(/,/g, "");
-          data["Cash on Delivery"] = currency + " " + amount;
+          entry.cod = currency + " " + codMatch[2].replace(/,/g, "");
+        }
+      }
+
+      // Order reference from Comments line
+      if (!entry.orderRef) {
+        var commentMatch = line.match(/Comments?:\s*(\S+)/i);
+        if (commentMatch) {
+          entry.orderRef = commentMatch[1].trim();
         }
       }
     }
 
-    // Finalize carrier detection
-    if (data["Tracking ID"] && !data["carrier"]) {
-      data["carrier"] = detectCarrier(data["Tracking ID"], text);
-    }
-
-    if (data["Tracking ID"]) {
-      results.push(data);
-    }
-
-    // For multi-page PDFs: the OCR produces one big text block.
-    // If there are multiple tracking IDs, find them all.
-    var allTrackings = text.match(/\b(NV[A-Z0-9]+|\d{10,16})\b/g) || [];
-    if (allTrackings.length > 1) {
-      // Already got the first one above; extract the rest as minimal records
-      for (var t = 1; t < allTrackings.length; t++) {
-        var tid = allTrackings[t];
-        // Skip if already captured
-        if (results.some(function(r) { return r["Tracking ID"] === tid; })) continue;
-        results.push({
-          "Tracking ID":       tid,
-          "Recipient Name":    "",
-          "Recipient Contact": "",
-          "Cash on Delivery":  "",
-          "carrier":           detectCarrier(tid, text)
-        });
-      }
-    }
+    // Don't forget the last entry
+    if (entry && entry.trackingId) results.push(entry);
 
   } finally {
     // Clean up temporary OCR document
@@ -140,7 +130,7 @@ function extractFromExcel(file) {
   }
 
   try {
-    var ss   = SpreadsheetApp.openById(tempFile.id);
+    var ss    = SpreadsheetApp.openById(tempFile.id);
     var sheet = ss.getActiveSheet();
     var data  = sheet.getDataRange().getValues();
 
@@ -149,32 +139,38 @@ function extractFromExcel(file) {
       var row = data[r];
       if (!row.some(function(cell) { return cell !== "" && cell !== null; })) continue;
 
-      var val = function(i) {
-        return (i < row.length && row[i] !== null && row[i] !== undefined) ? String(row[i]).trim() : "";
+      var val = function(idx) {
+        return (idx < row.length && row[idx] !== null && row[idx] !== undefined) ? String(row[idx]).trim() : "";
       };
 
       var tracking = val(1);  // Col B - Tracking ID
       if (!tracking) continue;
 
-      var cod = val(2);       // Col C - COD Amount
-      if (cod === "None" || cod === "undefined") cod = "";
+      var shipmentId = val(0); // Col A - Shipment ID
+      var cod = val(2);        // Col C - COD Amount
+      if (cod === "None" || cod === "undefined" || cod === "0") cod = "";
+
+      // Extract order reference from shipment ID (e.g., "MYHVHELG1-681130" → "elg1-681130")
+      var orderRef = "";
+      var refMatch = shipmentId.match(/[Ee][Ll][Gg]\d+-\d+/);
+      if (refMatch) orderRef = refMatch[0].toLowerCase();
 
       var carrier = detectCarrier(tracking);
       results.push({
-        "Tracking ID":       tracking,
-        "Shipment ID":       val(0),  // Col A
-        "Recipient Name":    val(3),  // Col D
-        "Recipient Contact": val(8),  // Col I
-        "Cash on Delivery":  cod,
-        "Address":           val(4),  // Col E
-        "City":              val(5),  // Col F
-        "State":             val(6),  // Col G
-        "PostalCode":        val(7),  // Col H
-        "carrier":           carrier
+        trackingId:     tracking,
+        shipmentId:     shipmentId,
+        recipientName:  val(3),  // Col D
+        recipientPhone: val(8),  // Col I
+        cod:            cod,
+        address:        val(4),  // Col E
+        city:           val(5),  // Col F
+        state:          val(6),  // Col G
+        postalCode:     val(7),  // Col H
+        carrier:        carrier,
+        orderRef:       orderRef
       });
     }
   } finally {
-    // Clean up temporary spreadsheet
     try { Drive.Files.remove(tempFile.id); } catch(e) {}
   }
 
@@ -228,13 +224,37 @@ function extractFromCsv(file) {
     }
 
     results.push({
-      "Tracking ID":       tracking,
-      "Recipient Name":    name,
-      "Recipient Contact": contact,
-      "Cash on Delivery":  cod,
-      "carrier":           detectCarrier(tracking)
+      trackingId:     tracking,
+      shipmentId:     "",
+      recipientName:  name,
+      recipientPhone: contact,
+      cod:            cod,
+      address:        "",
+      city:           "",
+      state:          "",
+      postalCode:     "",
+      carrier:        detectCarrier(tracking),
+      orderRef:       ""
     });
   }
 
   return results;
+}
+
+
+// ── HELPER ────────────────────────────────────────────────────────
+function makeEmptyEntry() {
+  return {
+    trackingId: "",
+    shipmentId: "",
+    recipientName: "",
+    recipientPhone: "",
+    cod: "",
+    address: "",
+    city: "",
+    state: "",
+    postalCode: "",
+    carrier: "",
+    orderRef: ""
+  };
 }
