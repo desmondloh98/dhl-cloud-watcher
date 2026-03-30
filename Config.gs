@@ -6,8 +6,8 @@
 var CONFIG = {
   // Google Drive folder IDs (get from the folder URL)
   // https://drive.google.com/drive/folders/XXXXXX  ← the XXXXXX part
-  FOLDER_ID:           "YOUR_AWB_DROP_ZONE_FOLDER_ID",
-  PROCESSED_FOLDER_ID: "YOUR_PROCESSED_SUBFOLDER_ID",
+  FOLDER_ID:           "1veP7qG5GmF0wuWxpIaz22fyZYPX1wHbZ",
+  PROCESSED_FOLDER_ID: "1QcNd3_W6FnYR8VhyAG3YN9wyHg5VBHVZ",
 
   // Target Google Sheet (Atomic Group Fulfilment Form)
   SPREADSHEET_ID: "1ie0hPh9iJO-JT5T4cEmHsioj2_WTUHz8gAiN2M1dzwE",
